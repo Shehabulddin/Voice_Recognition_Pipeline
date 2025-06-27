@@ -1,0 +1,425 @@
+import os
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import queue
+
+import sounddevice as sd
+import soundfile as sf
+import wavio
+import numpy as np
+import librosa
+import librosa.display
+import matplotlib
+matplotlib.use('Agg')  # Use a non-GUI backend for matplotlib
+import matplotlib.pyplot as plt
+import noisereduce as nr
+import tensorflow as tf
+
+# ---------------------------------------------------------------------
+# CONFIG & PATHS
+# ---------------------------------------------------------------------
+VOICE_RECORDING_PATH = r"D:\ML GUI\voice recording\voice_recording.wav"
+SPECTROGRAM_SAVE_PATH = r"D:\ML GUI\spectrograms"
+MODEL_PATH = r"D:\Models\ComplexModel.h5"
+
+os.makedirs(SPECTROGRAM_SAVE_PATH, exist_ok=True)
+
+# ---------------------------------------------------------------------
+# GLOBAL PARAMETERS
+# ---------------------------------------------------------------------
+RECORD_SECONDS = 6
+SAMPLING_RATE = 44100
+SEGMENT_LENGTH = 3
+SILENCE_THRESHOLD = 0.01
+FRAME_DURATION = 0.03
+GLOBAL_MIN_DB = -40
+GLOBAL_MAX_DB = 51
+
+# ---------------------------------------------------------------------
+# LOAD MODEL ONCE
+# ---------------------------------------------------------------------
+print("[DEBUG] Loading model from:", MODEL_PATH)
+model = tf.keras.models.load_model(MODEL_PATH)
+print("[DEBUG] Model loaded successfully.")
+
+# ---------------------------------------------------------------------
+# QUEUES FOR THREAD COMMUNICATION
+# ---------------------------------------------------------------------
+progress_queue = queue.Queue()  # Worker thread sends status/progress messages
+result_queue = queue.Queue()    # Final classification result
+error_queue = queue.Queue()     # Any exception messages
+
+# ---------------------------------------------------------------------
+# MICROPHONE SELECTION LOGIC
+# ---------------------------------------------------------------------
+def get_input_devices():
+    """
+    Returns a list of (device_index, device_name) for all input-capable devices.
+    """
+    print("[DEBUG] get_input_devices: Querying all sound devices...")
+    devices = sd.query_devices()
+    input_devices = []
+    for i, dev in enumerate(devices):
+        # If device has 1+ input channels
+        if dev['max_input_channels'] > 0:
+            input_devices.append((i, dev['name']))
+            print(f"[DEBUG]  -> Found input device idx={i}: '{dev['name']}'")
+    if not input_devices:
+        print("[DEBUG] No input devices found on this system.")
+    return input_devices
+
+print("[DEBUG] Gathering microphone list...")
+mic_devices = get_input_devices()
+mic_dict = {name: idx for (idx, name) in mic_devices}
+print("[DEBUG] mic_dict =", mic_dict)
+
+# ---------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ---------------------------------------------------------------------
+def record_audio(duration=RECORD_SECONDS, sample_rate=SAMPLING_RATE, device=None):
+    """
+    Records audio from 'device' (index) for 'duration' seconds.
+    Returns a 1D float32 numpy array.
+    """
+    debug_msg = f"[DEBUG] record_audio: Starting recording on device {device}, duration={duration}s"
+    print(debug_msg)
+    progress_queue.put(("status", 0, debug_msg))
+
+    recording = sd.rec(
+        int(duration * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype='float32',
+        device=device
+    )
+    sd.wait()  # block until finished
+    print("[DEBUG] record_audio: Recording finished. Audio shape =", recording.shape)
+
+    return recording.flatten()
+
+def remove_silence(audio, sr, frame_duration=FRAME_DURATION, silence_threshold=SILENCE_THRESHOLD):
+    """
+    Removes silence via a simple amplitude threshold approach.
+    """
+    debug_msg = f"[DEBUG] remove_silence: Start, len(audio)={len(audio)}, sr={sr}"
+    print(debug_msg)
+    progress_queue.put(("status", 0, debug_msg))
+
+    frame_length = int(sr * frame_duration)
+    hop_length = frame_length
+    non_silent_frames = []
+
+    for i in range(0, len(audio), hop_length):
+        frame = audio[i : i + frame_length]
+        if len(frame) < frame_length:
+            print(f"[DEBUG] remove_silence: final short frame at index={i}, len(frame)={len(frame)} -> break")
+            break
+
+        frame_energy = np.mean(np.abs(frame))
+        if frame_energy > silence_threshold:
+            non_silent_frames.append(frame)
+
+    if non_silent_frames:
+        processed_audio = np.concatenate(non_silent_frames)
+        print(f"[DEBUG] remove_silence: Found {len(non_silent_frames)} non-silent frames, total len={len(processed_audio)}")
+    else:
+        processed_audio = np.array([])
+        print("[DEBUG] remove_silence: All frames below threshold -> empty audio.")
+
+    debug_end_msg = f"[DEBUG] remove_silence: End, returning audio of len={len(processed_audio)}"
+    print(debug_end_msg)
+    progress_queue.put(("status", 0, debug_end_msg))
+
+    return processed_audio
+
+def save_spectrogram(segment_audio, sr, prefix, segment_index):
+    """
+    Creates and saves a spectrogram .png for a single audio segment.
+    """
+    debug_msg = f"[DEBUG] save_spectrogram: segment_index={segment_index}, len(segment)={len(segment_audio)}"
+    print(debug_msg)
+    progress_queue.put(("status", 0, debug_msg))
+
+    stft = librosa.stft(segment_audio)
+    stft_db = librosa.amplitude_to_db(np.abs(stft))
+
+    plt.figure(figsize=(4, 5), dpi=100)
+    librosa.display.specshow(
+        stft_db,
+        sr=sr,
+        x_axis=None,
+        y_axis=None,
+        vmin=GLOBAL_MIN_DB,
+        vmax=GLOBAL_MAX_DB,
+        cmap='gray'
+    )
+    plt.axis('off')
+    plt.tight_layout(pad=0)
+
+    segment_filename = f"{prefix}_segment{segment_index}.png"
+    full_path = os.path.join(SPECTROGRAM_SAVE_PATH, segment_filename)
+    plt.savefig(full_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+    print(f"[DEBUG] save_spectrogram: Saved to {full_path}")
+    return full_path
+
+def process_single_voice_recording(audio_file):
+    """
+    Loads audio with soundfile (sf.read), resamples if necessary,
+    reduces noise, removes silence, segments, saves spectrograms.
+    Returns list of spectrogram file paths.
+    """
+    print(f"[DEBUG] process_single_voice_recording: Using soundfile.read('{audio_file}')")
+    data, original_sr = sf.read(audio_file)
+    print(f"[DEBUG] soundfile.read: got data length={len(data)}, original_sr={original_sr}")
+
+    # If needed, resample to SAMPLING_RATE
+    if original_sr != SAMPLING_RATE:
+        print(f"[DEBUG] Resampling from {original_sr} to {SAMPLING_RATE}...")
+        data = librosa.resample(data, orig_sr=original_sr, target_sr=SAMPLING_RATE)
+        sr = SAMPLING_RATE
+    else:
+        sr = original_sr
+
+    print(f"[DEBUG] After optional resample: len={len(data)}, sr={sr}")
+
+    # Convert to float32 if not already
+    if data.dtype != np.float32:
+        print(f"[DEBUG] Converting data to float32 from {data.dtype}")
+        data = data.astype(np.float32)
+
+    # Noise reduction
+    print("[DEBUG] process_single_voice_recording: Starting noise reduction...")
+    noise_profile = data[: int(sr * 0.5)]
+    reduced_noise = nr.reduce_noise(
+        y=data,
+        sr=sr,
+        y_noise=noise_profile,
+        prop_decrease=0.8
+    )
+    print("[DEBUG] process_single_voice_recording: Noise reduction done.")
+
+    # Silence removal
+    print("[DEBUG] process_single_voice_recording: Removing silence...")
+    cleaned_audio = remove_silence(reduced_noise, sr)
+    print(f"[DEBUG] process_single_voice_recording: cleaned_audio len={len(cleaned_audio)}")
+
+    # Segment
+    print("[DEBUG] process_single_voice_recording: Segmenting audio...")
+    samples_per_segment = int(SEGMENT_LENGTH * sr)
+    segment_index = 1
+    spectrogram_paths = []
+
+    for i in range(0, len(cleaned_audio), samples_per_segment):
+        segment_audio = cleaned_audio[i : i + samples_per_segment]
+        if len(segment_audio) >= samples_per_segment:
+            path = save_spectrogram(segment_audio, sr, "voice_recording", segment_index)
+            spectrogram_paths.append(path)
+            segment_index += 1
+        else:
+            # leftover is handled below
+            pass
+
+    # Partial leftover
+    remaining_audio = len(cleaned_audio) % samples_per_segment
+    if remaining_audio > 0:
+        leftover_segment = cleaned_audio[-remaining_audio:]
+        path = save_spectrogram(leftover_segment, sr, "voice_recording", segment_index)
+        spectrogram_paths.append(path)
+        print(f"[DEBUG] process_single_voice_recording: leftover segment len={remaining_audio}")
+
+    print(f"[DEBUG] process_single_voice_recording: Created {len(spectrogram_paths)} spectrogram(s).")
+    return spectrogram_paths
+
+def preprocess_image_for_model(image_path, img_height=512, img_width=512):
+    """
+    Loads a spectrogram image, resizes, and scales for the model.
+    """
+    debug_msg = f"[DEBUG] preprocess_image_for_model: Loading {image_path}"
+    print(debug_msg)
+    progress_queue.put(("status", 0, debug_msg))
+
+    img = tf.keras.preprocessing.image.load_img(image_path, target_size=(img_height, img_width))
+    img_array = tf.keras.preprocessing.image.img_to_array(img) / 255.0
+    return np.expand_dims(img_array, axis=0)
+
+def predict_spectrograms(spectrogram_paths):
+    """
+    Runs inference on each spectrogram. Returns list of probabilities.
+    """
+    predictions = []
+    for path in spectrogram_paths:
+        debug_msg = f"[DEBUG] predict_spectrograms: Predicting {path}"
+        print(debug_msg)
+        progress_queue.put(("status", 0, debug_msg))
+
+        img_tensor = preprocess_image_for_model(path)
+        pred_prob = model.predict(img_tensor)[0][0]
+        print(f"[DEBUG] predict_spectrograms: Probability={pred_prob:.4f}")
+        predictions.append(pred_prob)
+    return predictions
+
+def get_aggregate_result(predictions, threshold=0.5):
+    """
+    Averages probabilities and compares to threshold. Returns textual result.
+    """
+    print(f"[DEBUG] get_aggregate_result: #predictions={len(predictions)}")
+    if not predictions:
+        return "No segments found; possibly silent or no data."
+    avg_prob = np.mean(predictions)
+    pred_class = 1 if avg_prob > threshold else 0
+    return f"Average Probability={avg_prob:.2f} => Predicted Class={pred_class}"
+
+# ---------------------------------------------------------------------
+# BACKGROUND WORKER (PIPELINE)
+# ---------------------------------------------------------------------
+def pipeline_worker(selected_device_index):
+    """
+    Records audio from the user-selected device, processes spectrograms,
+    runs inference, updates the queues. Runs in a background thread.
+    """
+    try:
+        print("[DEBUG] pipeline_worker: Starting pipeline with device index =", selected_device_index)
+        # STEP 1: Record
+        audio_data = record_audio(device=selected_device_index)
+        progress_queue.put(("status", 0, "[DEBUG] Recording complete."))
+        print("[DEBUG] pipeline_worker: Audio recorded, len=", len(audio_data))
+
+        # STEP 2: Save WAV
+        wavio.write(VOICE_RECORDING_PATH, audio_data, SAMPLING_RATE, sampwidth=2)
+        file_size = os.path.getsize(VOICE_RECORDING_PATH)
+        msg = f"[DEBUG] WAV saved to {VOICE_RECORDING_PATH}, size={file_size} bytes"
+        print(msg)
+        progress_queue.put(("status", 0, msg))
+
+        # STEP 3: Generate spectrograms (now uses soundfile instead of librosa.load)
+        progress_queue.put(("status", 0, "[DEBUG] Generating spectrograms..."))
+        print("[DEBUG] pipeline_worker: Processing single voice recording with soundfile...")
+        spectrogram_paths = process_single_voice_recording(VOICE_RECORDING_PATH)
+        num_specs = len(spectrogram_paths)
+        print("[DEBUG] pipeline_worker: #spectrograms =", num_specs)
+
+        # STEP 4: Predict
+        if num_specs == 0:
+            final_text = "No segments found; possibly silent audio."
+            print("[DEBUG] pipeline_worker: No segments -> finishing.")
+            result_queue.put(final_text)
+            return
+
+        progress_queue.put(("status", 0, f"[DEBUG] Predicting on {num_specs} spectrograms..."))
+        predictions = []
+        for idx, path in enumerate(spectrogram_paths, start=1):
+            step_msg = f"[DEBUG] Inference on spectrogram {idx}/{num_specs}"
+            print(step_msg)
+            progress_queue.put(("status", 0, step_msg))
+
+            img_tensor = preprocess_image_for_model(path)
+            pred_prob = model.predict(img_tensor)[0][0]
+            predictions.append(pred_prob)
+
+            progress_val = idx / num_specs * 100
+            progress_queue.put(("step", progress_val, None))
+
+        # STEP 5: Aggregate
+        final_text = get_aggregate_result(predictions)
+        print("[DEBUG] pipeline_worker: Final result ->", final_text)
+        result_queue.put(final_text)
+
+    except Exception as e:
+        err_str = f"[DEBUG] pipeline_worker: Exception occurred: {str(e)}"
+        print(err_str)
+        error_queue.put(err_str)
+
+def check_worker_thread():
+    """
+    Periodically checks progress_queue, error_queue, result_queue,
+    and updates the GUI accordingly.
+    """
+    while True:
+        try:
+            msg_type, value, text_msg = progress_queue.get_nowait()
+            if msg_type == "status":
+                if text_msg:
+                    status_label.config(text=text_msg)
+            elif msg_type == "step":
+                progress_bar["value"] = value
+                if text_msg:
+                    status_label.config(text=text_msg)
+        except queue.Empty:
+            break
+
+    if not error_queue.empty():
+        err_msg = error_queue.get_nowait()
+        status_label.config(text=err_msg)
+        record_button.config(state="normal")
+        return
+
+    if not result_queue.empty():
+        final_text = result_queue.get_nowait()
+        result_label.config(text=final_text)
+        status_label.config(text="")
+        record_button.config(state="normal")
+    else:
+        window.after(100, check_worker_thread)
+
+def on_record_button_click():
+    """
+    - Disables the button
+    - Gets device index from combo
+    - Spawns pipeline worker
+    - Schedules progress checks
+    """
+    record_button.config(state="disabled")
+    result_label.config(text="")
+    status_label.config(text="[DEBUG] Starting pipeline...")
+    progress_bar["value"] = 0
+
+    selected_device_name = mic_var.get()
+    selected_device_index = mic_dict.get(selected_device_name, None)
+    print(f"[DEBUG] on_record_button_click: User chose device='{selected_device_name}', index={selected_device_index}")
+
+    worker = threading.Thread(target=pipeline_worker, args=(selected_device_index,), daemon=True)
+    worker.start()
+    window.after(100, check_worker_thread)
+
+# ---------------------------------------------------------------------
+# TKINTER GUI
+# ---------------------------------------------------------------------
+window = tk.Tk()
+window.title("Voice Recording & Classification (soundfile-based)")
+
+frame = tk.Frame(window, padx=10, pady=10)
+frame.pack()
+
+title_label = tk.Label(frame, text="Voice Classification Demo (Using soundfile)", font=("Arial", 16, "bold"))
+title_label.pack(pady=10)
+
+# Microphone selection UI
+mic_label = tk.Label(frame, text="Select Microphone:")
+mic_label.pack()
+
+if not mic_devices:
+    mic_devices = [(None, "No Microphones Detected")]
+
+device_names = [dev[1] for dev in mic_devices]
+
+mic_var = tk.StringVar()
+mic_var.set(device_names[0])  # default to the first in the list
+mic_combobox = ttk.Combobox(frame, textvariable=mic_var, values=device_names, state="readonly", width=40)
+mic_combobox.pack(pady=5)
+
+progress_bar = ttk.Progressbar(frame, orient="horizontal", length=400, mode="determinate", maximum=100, value=0)
+progress_bar.pack(pady=5)
+
+status_label = tk.Label(frame, text="", font=("Arial", 10), fg="blue")
+status_label.pack(pady=5)
+
+record_button = tk.Button(frame, text="Record & Test", command=on_record_button_click, bg="green", fg="white")
+record_button.pack(pady=5)
+
+result_label = tk.Label(frame, text="", font=("Arial", 12))
+result_label.pack(pady=20)
+
+window.mainloop()

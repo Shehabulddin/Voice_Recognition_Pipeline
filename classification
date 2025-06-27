@@ -1,0 +1,274 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import librosa
+import librosa.display
+import tensorflow as tf
+import IPython.display as ipd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
+from tensorflow.keras import Model
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.image import load_img, img_to_array, ImageDataGenerator
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+from tensorflow.keras.models import load_model
+from sklearn.utils import shuffle
+from PIL import ImageFile
+from sklearn.metrics import f1_score
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+image_path = ""  #change to wherever specros are
+
+pectrograms = os.listdir(image_path)
+
+class_1_prefixes = {'f1_', 'f7_', 'f8_', 'm3_', 'm6_', 'm8_'}
+file_labels = []
+
+for file_name in spectrograms:
+    prefix = file_name[:3] 
+    script = '_'.join(file_name.split('_')[:2])  
+    label = 1 if prefix in class_1_prefixes else 0
+    file_labels.append([file_name, script, label])
+
+
+df = pd.DataFrame(file_labels, columns=['file_name', 'script_id', 'label'])
+
+
+df['file_name'] = df['file_name'].apply(lambda x: os.path.join(image_path, x))
+
+
+print("Unique script IDs and their labels:")
+print(df[['script_id', 'label']].drop_duplicates())
+
+# grouping by script_id and label here
+scripts = df[['script_id', 'label']].drop_duplicates()
+
+
+train_val_ids, test_ids = train_test_split(
+    scripts['script_id'],
+    test_size=0.2,
+    random_state=42,
+    stratify=scripts['label']
+)
+
+train_ids, val_ids = train_test_split(
+    train_val_ids,
+    test_size=0.125,
+    random_state=42,
+    stratify=scripts[scripts['script_id'].isin(train_val_ids)]['label']
+)
+
+
+train_ids = list(train_ids)
+val_ids = list(val_ids)
+test_ids = list(test_ids)
+
+
+def assign_set(script_id):
+    if script_id in train_ids:
+        return 'train'
+    elif script_id in val_ids:
+        return 'val'
+    elif script_id in test_ids:
+        return 'test'
+    else:
+        return 'unknown'
+
+df['set'] = df['script_id'].apply(assign_set)
+
+
+print("Dataset split counts:")
+print(df['set'].value_counts())
+
+
+print(f"Training set: {len(df[df['set'] == 'train'])} samples")
+print(f"Validation set: {len(df[df['set'] == 'val'])} samples")
+print(f"Test set: {len(df[df['set'] == 'test'])} samples")
+
+# Display class counts for each split
+for dataset in ['train', 'val', 'test']:
+    subset = df[df['set'] == dataset]
+    class_counts = subset['label'].value_counts()
+    print(f"\n{dataset.capitalize()} set class distribution:")
+    print(f"Class 0: {class_counts.get(0, 0)}")
+    print(f"Class 1: {class_counts.get(1, 0)}")
+
+df[df['set'] == 'train'].to_csv(os.path.join(image_path, 'train_set.csv'), index=False)
+df[df['set'] == 'val'].to_csv(os.path.join(image_path, 'val_set.csv'), index=False)
+df[df['set'] == 'test'].to_csv(os.path.join(image_path, 'test_set.csv'), index=False)
+
+print("Datasets are split and saved in the folder:", image_path)
+ 
+
+# Load the CSV files with the train, validation, and test splits
+train_set = pd.read_csv(os.path.join(image_path, 'train_set.csv'))
+val_set = pd.read_csv(os.path.join(image_path, 'val_set.csv'))
+test_set = pd.read_csv(os.path.join(image_path, 'test_set.csv'))
+
+def check_script_consistency(dataset, set_name):
+    inconsistencies = dataset.groupby('script_id')['set'].nunique()
+    inconsistent_scripts = inconsistencies[inconsistencies > 1]
+    return inconsistent_scripts
+
+train_inconsistencies = check_script_consistency(train_set, 'train')
+val_inconsistencies = check_script_consistency(val_set, 'val')
+test_inconsistencies = check_script_consistency(test_set, 'test')
+
+train_balance = train_set['label'].value_counts(normalize=True)
+val_balance = val_set['label'].value_counts(normalize=True)
+test_balance = test_set['label'].value_counts(normalize=True)
+
+script_distribution = {
+    "train_scripts": train_set['script_id'].nunique(),
+    "val_scripts": val_set['script_id'].nunique(),
+    "test_scripts": test_set['script_id'].nunique(),
+}
+
+combined_set = pd.concat([train_set, val_set, test_set])
+script_set_consistency = combined_set.groupby('script_id')['set'].nunique()
+inconsistent_scripts_across_sets = script_set_consistency[script_set_consistency > 1]
+
+{
+    "train_inconsistencies": train_inconsistencies,
+    "val_inconsistencies": val_inconsistencies,
+    "test_inconsistencies": test_inconsistencies,
+    "train_balance": train_balance,
+    "val_balance": val_balance,
+    "test_balance": test_balance,
+    "script_distribution": script_distribution,
+    "inconsistent_scripts_across_sets": inconsistent_scripts_across_sets
+}
+
+
+# Load the CSV files with the train, validation, and test splits
+train_df = pd.read_csv(os.path.join(image_path, 'train_set.csv'))
+val_df = pd.read_csv(os.path.join(image_path, 'val_set.csv'))
+test_df = pd.read_csv(os.path.join(image_path, 'test_set.csv'))
+
+# Image dimensions
+IMG_HEIGHT = 512
+IMG_WIDTH = 512
+BATCH_SIZE = 32
+
+# Data generators for loading the images
+train_datagen = ImageDataGenerator(rescale=1./255)
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
+
+# Convert label column to string type for compatibility with binary class mode
+train_df['label'] = train_df['label'].astype(str)
+val_df['label'] = val_df['label'].astype(str)
+test_df['label'] = test_df['label'].astype(str)
+
+# Data generators for loading the images
+train_generator = train_datagen.flow_from_dataframe(
+    train_df,
+    x_col='file_name',
+    y_col='label',
+    target_size=(IMG_HEIGHT, IMG_WIDTH),
+    batch_size=BATCH_SIZE,
+    class_mode='binary'
+)
+
+val_generator = val_datagen.flow_from_dataframe(
+    val_df,
+    x_col='file_name',
+    y_col='label',
+    target_size=(IMG_HEIGHT, IMG_WIDTH),
+    batch_size=BATCH_SIZE,
+    class_mode='binary'
+)
+
+test_generator = test_datagen.flow_from_dataframe(
+    test_df,
+    x_col='file_name',
+    y_col='label',
+    target_size=(IMG_HEIGHT, IMG_WIDTH),
+    batch_size=1,
+    class_mode='binary',
+    shuffle=False
+)
+
+
+# Build the CNN model with Dropout layers to prevent overfitting
+model = Sequential([
+    Conv2D(32, (3, 3), activation='relu',  input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)),
+    MaxPooling2D((2, 2)),
+
+    Conv2D(64, (3, 3), activation='relu'),
+    MaxPooling2D((2, 2)),
+    
+    Conv2D(128, (3, 3), activation='relu'),
+    MaxPooling2D((2, 2)),
+
+    Conv2D(256, (3, 3), activation='relu'),
+    MaxPooling2D((2, 2)),
+    
+    Flatten(),
+    Dense(256, activation='relu'),
+    Dropout(0.6),
+    Dense(1, activation='sigmoid')
+])
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Define early stopping
+early_stopping = EarlyStopping(
+    monitor='val_loss',       # Metric to monitor
+    patience=5,               # Number of epochs without improvement before stopping
+    restore_best_weights=True # Restore the model weights from the epoch with the best value
+)
+
+# Train the model
+history = model.fit(
+    train_generator,
+    validation_data=val_generator,  
+    epochs=7,
+    callbacks=[early_stopping]  
+)
+
+# Save the trained model
+model.save('D:\\Models\\ComplexModel.h5')
+
+# Evaluate the model on the test set
+loss, accuracy = model.evaluate(test_generator)
+print(f'Test Accuracy: {accuracy * 100:.2f}%')
+
+# Predict the labels for the test set
+y_pred_probs = model.predict(test_generator)
+
+# Convert y_pred to strings to match y_true
+y_pred = (y_pred_probs > 0.5).astype(int).astype(str).ravel()
+
+# Get the true labels (they are already strings)
+y_true = test_df['label'].values
+
+# Calculate F1 score
+f1 = f1_score(y_true, y_pred, pos_label='1', average='binary')
+print(f'F1 Score: {f1:.2f}')
+
+# Plot accuracy and loss
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.show()
